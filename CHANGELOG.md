@@ -36,6 +36,9 @@ Everything to date; Concord's history begins 2026-10 with the commits below.
 
 ### Fixed
 
+- The CLI answers an unknown flag, or a flag missing its value, with one line that names the
+  flag, suggests the closest known one and points to `concord --help`, instead of Node's raw
+  parser message (#581).
 - Register imports reject as-of times more than five minutes in the future (#100).
 
 ### Added
