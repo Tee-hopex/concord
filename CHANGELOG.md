@@ -57,6 +57,10 @@ Everything to date; Concord's history begins 2026-10 with the commits below.
 - A per-asset reconciliation `tolerance` (smallest units): a holder whose chain and register
   balances differ by no more than it is treated as matched. Schema: `ORG_MIGRATIONS` v5 adds
   `assets.tolerance` (#564).
+- Holdings checkpoints (#576): historical holdings (`asOf`), corporate-action snapshots and the
+  current holdings replay from the nearest stored checkpoint, so their cost near the tip no longer
+  grows with the length of the history. Results are unchanged. Schema: `ORG_MIGRATIONS` entry 6
+  adds the `holdings_checkpoints` table and the `events_asset_ledger` index on `events`.
 - CSV templates can include one illustrative example row with `?example=1` or `?example=true` (#200).
 - The accounting core (`feat(core)`, `c402eae`): holdings replay from CAP-67 events, position
   and movement reconciliation with typed breaks, corporate-action entitlements (dividend,

@@ -77,6 +77,20 @@ describe("databases written by earlier builds", () => {
     });
   });
 
+  it("adds an empty holdings checkpoint table and the event ledger index to a v5 workspace database", () => {
+    upgraded("org-v5.db", ORG_MIGRATIONS, (db) => {
+      expect(db.get<{ n: number }>("SELECT COUNT(*) AS n FROM holdings_checkpoints")?.n).toBe(0);
+      expect(db.get("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'events_asset_ledger'")).toBeDefined();
+    });
+  });
+
+  it("opens the v6 workspace database and keeps its holdings checkpoints", () => {
+    upgraded("org-v6.db", ORG_MIGRATIONS, (db) => {
+      expect(db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'fixture'")?.value).toBe("org-v6");
+      expect(db.get<{ ledger: number }>("SELECT ledger FROM holdings_checkpoints WHERE asset_id = 'usd-mainnet'")?.ledger).toBe(100);
+    });
+  });
+
   it("opens the v1 control database with the current migrations and keeps its rows", () => {
     upgraded("control-v1.db", CONTROL_MIGRATIONS, (db) => {
       expect(db.get<{ name: string }>("SELECT name FROM users WHERE id = 'u1'")?.name).toBe("Alice");

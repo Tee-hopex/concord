@@ -174,6 +174,20 @@ ALTER TABLE assets ADD COLUMN movement_window_hours INTEGER NOT NULL DEFAULT 24;
 `,
   // v5: per-asset reconciliation tolerance (smallest units as TEXT to preserve bigint precision).
   `ALTER TABLE assets ADD COLUMN tolerance TEXT;`,
+  // v6: holdings checkpoints, so a historical holdings(asOf) or a corporate-action snapshot replays
+  // only the events after the nearest earlier checkpoint. Derived data: Concord rebuilds any row
+  // it finds missing, so deleting them is always safe.
+  `
+CREATE TABLE holdings_checkpoints (
+  asset_id TEXT NOT NULL REFERENCES assets (id) ON DELETE CASCADE,
+  ledger INTEGER NOT NULL,
+  closed_at TEXT NOT NULL,
+  state TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (asset_id, ledger)
+);
+CREATE INDEX events_asset_ledger ON events (asset_id, ledger);
+`,
 ];
 
 /** Identity: who may sign in, and which workspace each session is bound to. */

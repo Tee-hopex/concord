@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import Ajv from "ajv";
 import { Keypair, StrKey, nativeToScVal } from "@stellar/stellar-sdk";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { replay, type HoldingsState } from "@concord/core";
 import { ChainError, StellarSource, cursorLedger, decodeEvent, type AssetCandidate } from "../src/chain.js";
 import { USAGE } from "../src/cli-usage.js";
 import { Concord, Invalid, NotFound, describeFailure } from "../src/concord.js";
@@ -2688,6 +2689,209 @@ describe("README CLI examples", () => {
       for (const flag of line.match(/--[\w-]+/g) ?? []) {
         expect(usageFlags.has(flag), `README example passes "${flag}", but the CLI usage text does not name it`).toBe(true);
       }
+    }
+  });
+});
+
+describe("holdings checkpoints", () => {
+  const issuer = key();
+  const holders = Array.from({ length: 6 }, () => key());
+
+  /** Deterministic pseudo-random numbers (mulberry32), so a failing seed can be replayed. */
+  function rng(seed: number): () => number {
+    let t = seed >>> 0;
+    return () => {
+      t = (t + 0x6d2b79f5) >>> 0;
+      let r = Math.imul(t ^ (t >>> 15), 1 | t);
+      r = (r + Math.imul(r ^ (r >>> 7), 61 | r)) ^ r;
+      return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  /** Every kind of event, overdrawn holders and malformed events included. */
+  function pushRandom(chain: FakeChain, assetId: string, next: () => number, ledgers: [number, number], count: number) {
+    const pick = () => holders[Math.floor(next() * holders.length)]!;
+    for (let i = 0; i < count; i++) {
+      const ledger = ledgers[0] + Math.floor(next() * (ledgers[1] - ledgers[0] + 1));
+      const amount = BigInt(1 + Math.floor(next() * 50));
+      const roll = next();
+      if (roll < 0.25) chain.push(assetId, "mint", ledger, { to: pick(), amount });
+      else if (roll < 0.6) chain.push(assetId, "transfer", ledger, { from: pick(), to: pick(), amount });
+      else if (roll < 0.7) chain.push(assetId, "burn", ledger, { from: pick(), amount });
+      else if (roll < 0.8) chain.push(assetId, "clawback", ledger, { from: pick(), amount });
+      else if (roll < 0.95) chain.push(assetId, "set_authorized", ledger, { from: pick(), authorized: next() < 0.5 });
+      else chain.push(assetId, "transfer", ledger, { from: pick(), amount });
+    }
+  }
+
+  function comparable(s: HoldingsState) {
+    const byAddress = <V,>(m: Map<string, V>) => [...m].sort(([a], [b]) => a.localeCompare(b));
+    return {
+      balances: byAddress(s.balances),
+      authorized: byAddress(s.authorized),
+      supply: s.supply,
+      ledger: s.ledger,
+      eventCount: s.eventCount,
+      incomplete: s.incomplete,
+      skipped: (s.skipped ?? []).map((ev) => ev.id),
+    };
+  }
+
+  /** The oracle: one replay over everything the chain holds for the asset, no checkpoints. */
+  function fullReplay(chain: FakeChain, concord: Concord, assetId: string, upToTime?: string) {
+    const asset = concord.asset(assetId);
+    const events = chain.events.filter(
+      (e) => e.assetId === assetId && e.ledger >= asset.startLedger! && e.ledger <= chain.latest,
+    );
+    const opening = asset.baselineLedger === undefined ? undefined : chain.baselineResult?.openings;
+    return replay(events, {
+      ...(opening ? { opening } : {}),
+      baselineLedger: asset.baselineLedger ?? 0,
+      ...(upToTime ? { upToTime } : {}),
+    });
+  }
+
+  function expectExact(chain: FakeChain, concord: Concord, assetId: string, ledgers: number) {
+    const asset = concord.asset(assetId);
+    const times: (string | undefined)[] = [undefined];
+    // Every ledger's close time (where checkpoints sit), and some times between two closes.
+    for (let l = 0; l <= ledgers; l++) {
+      times.push(at(l));
+      if (l % 5 === 0) times.push(new Date(Date.parse(at(l)) + 30_000).toISOString());
+    }
+    for (const t of times) {
+      expect(comparable(concord.state(asset, t)), `as of ${t ?? "now"}`).toEqual(
+        comparable(fullReplay(chain, concord, assetId, t)),
+      );
+    }
+  }
+
+  const checkpoints = (concord: Concord, assetId: string) =>
+    concord.db
+      .all<{ ledger: number }>("SELECT ledger FROM holdings_checkpoints WHERE asset_id = ? ORDER BY ledger", assetId)
+      .map((r) => r.ledger);
+
+  it("gives the result of a full replay at every as-of time, whichever checkpoint it starts from", async () => {
+    for (const seed of [1, 2, 3]) {
+      const chain = new FakeChain();
+      chain.latest = 150;
+      const concord = new Concord(
+        new Db(":memory:"),
+        { testnet: { passphrase: PASSPHRASE, chain } },
+        { checkpointEvery: 1 + seed * 7 },
+      );
+      const next = rng(seed);
+      const window = await concord.watchAsset({ network: "testnet", asset: `WIN${seed}:${issuer}`, fromLedger: 1 });
+      // Opening balances with a cutoff of their own per holder, and one holder frozen at the start.
+      chain.baselineResult = {
+        ledger: 100,
+        openings: new Map(
+          holders
+            .slice(0, 3)
+            .map((h, i) => [h, { amount: BigInt(100 + i), authorized: i !== 1, asOfLedger: 100 + i * 5 }]),
+        ),
+      };
+      const base = await concord.watchAsset({ network: "testnet", asset: `BASE${seed}:${key()}` });
+
+      // Indexed in two passes, read in between, so checkpoints are extended as well as built.
+      pushRandom(chain, window.id, next, [2, 150], 200);
+      pushRandom(chain, base.id, next, [95, 150], 120);
+      await concord.syncAll();
+      expectExact(chain, concord, window.id, 150);
+      expectExact(chain, concord, base.id, 150);
+
+      chain.latest = 300;
+      pushRandom(chain, window.id, next, [151, 300], 200);
+      pushRandom(chain, base.id, next, [151, 300], 200);
+      await concord.syncAll();
+      expectExact(chain, concord, window.id, 300);
+      expectExact(chain, concord, base.id, 300);
+
+      expect(checkpoints(concord, window.id).length).toBeGreaterThan(5);
+      expect(checkpoints(concord, base.id).length).toBeGreaterThan(5);
+      // The newest ledger may still gain events, so no checkpoint stands on it.
+      const newest = Math.max(...chain.events.filter((e) => e.assetId === window.id).map((e) => e.ledger));
+      expect(Math.max(...checkpoints(concord, window.id))).toBeLessThan(newest);
+    }
+  }, 30_000);
+
+  it("reads only the events after the nearest checkpoint, however long the history", async () => {
+    const read: number[] = [];
+    for (const length of [2_000, 10_000]) {
+      const chain = new FakeChain();
+      chain.latest = 300;
+      const db = new Db(":memory:");
+      const concord = new Concord(db, { testnet: { passphrase: PASSPHRASE, chain } }, { checkpointEvery: 100 });
+      const asset = await concord.watchAsset({ network: "testnet", asset: `LONG:${issuer}`, fromLedger: 1 });
+      for (let i = 0; i < length; i++) {
+        chain.push(asset.id, "mint", 2 + Math.floor((i * 280) / length), { to: holders[i % holders.length]!, amount: 1n });
+      }
+      await concord.sync(asset.id);
+      concord.state(concord.asset(asset.id), at(290));
+
+      let rows = 0;
+      const all = db.all.bind(db);
+      db.all = ((...args: Parameters<Db["all"]>) => {
+        const out = all(...args);
+        if (args[0].includes("FROM events")) rows += out.length;
+        return out;
+      }) as Db["all"];
+      expect(concord.state(concord.asset(asset.id), at(290)).supply).toBe(BigInt(length));
+      read.push(rows);
+    }
+    // At most a checkpoint's worth of events plus the newest ledgers, for either length.
+    for (const rows of read) expect(rows).toBeLessThan(250);
+  });
+
+  it("drops the checkpoints a late event falls under", async () => {
+    const chain = new FakeChain();
+    chain.latest = 300;
+    const concord = new Concord(new Db(":memory:"), { testnet: { passphrase: PASSPHRASE, chain } }, { checkpointEvery: 10 });
+    const asset = await concord.watchAsset({ network: "testnet", asset: `LATE:${issuer}`, fromLedger: 1 });
+    pushRandom(chain, asset.id, rng(42), [2, 290], 300);
+    await concord.sync(asset.id);
+    concord.state(concord.asset(asset.id), at(290));
+    expect(checkpoints(concord, asset.id).some((l) => l < 50)).toBe(true);
+    expect(checkpoints(concord, asset.id).some((l) => l >= 50)).toBe(true);
+
+    // An event for ledger 50 that the RPC only hands over now, after its ledger was checkpointed.
+    const late = chain.push(asset.id, "mint", 50, { to: holders[0]!, amount: 7n });
+    const getEvents = chain.getEvents.bind(chain);
+    chain.getEvents = async (...args) => {
+      const page = await getEvents(...args);
+      return { ...page, events: [late, ...page.events] };
+    };
+    chain.advance(1);
+    await concord.sync(asset.id);
+    expect(checkpoints(concord, asset.id).every((l) => l < 50)).toBe(true);
+    expectExact(chain, concord, asset.id, 300);
+  });
+
+  it("drops an asset's checkpoints when it is rebuilt from fresh opening balances", async () => {
+    const chain = new FakeChain();
+    chain.latest = 300;
+    const concord = new Concord(new Db(":memory:"), { testnet: { passphrase: PASSPHRASE, chain } }, { checkpointEvery: 10 });
+    const asset = await concord.watchAsset({ network: "testnet", asset: `REB:${issuer}`, fromLedger: 1 });
+    pushRandom(chain, asset.id, rng(7), [2, 290], 300);
+    await concord.sync(asset.id);
+    concord.state(concord.asset(asset.id), at(290));
+    expect(checkpoints(concord, asset.id).length).toBeGreaterThan(0);
+
+    chain.baselineResult = {
+      ledger: 200,
+      openings: new Map([[holders[0]!, { amount: 500n, authorized: true, asOfLedger: 200 }]]),
+    };
+    await concord.rebuild(asset.id);
+    expect(checkpoints(concord, asset.id)).toEqual([]);
+    expectExact(chain, concord, asset.id, 300);
+    expect(checkpoints(concord, asset.id).length).toBeGreaterThan(0);
+  });
+
+  it("refuses a checkpoint interval that is not a positive integer", () => {
+    for (const checkpointEvery of [0, -1, 1.5, Number.NaN]) {
+      expect(() => new Concord(new Db(":memory:"), {}, { checkpointEvery })).toThrow(
+        "checkpointEvery must be a positive integer",
+      );
     }
   });
 });

@@ -13,6 +13,7 @@ import {
   reconcilePositions,
   redemptionDeltas,
   replay,
+  sortEvents,
   splitCashInLieu,
   splitDeltas,
   toCsv,
@@ -367,6 +368,86 @@ function toEvent(row: Row): AssetEvent {
   return ev;
 }
 
+/** Events folded in between two holdings checkpoints. */
+export const CHECKPOINT_EVERY = 1000;
+
+function encodeCheckpoint(state: HoldingsState): string {
+  return JSON.stringify({
+    balances: Object.fromEntries([...state.balances].map(([address, units]) => [address, units.toString()])),
+    authorized: Object.fromEntries(state.authorized),
+    ledger: state.ledger,
+    eventCount: state.eventCount,
+    skipped: (state.skipped ?? []).map((ev) => ({ ...ev, amount: ev.amount.toString() })),
+  });
+}
+
+function decodeCheckpoint(text: string): HoldingsState {
+  const stored = JSON.parse(text) as {
+    balances: Record<string, string>;
+    authorized: Record<string, boolean>;
+    ledger: number;
+    eventCount: number;
+    skipped: (Omit<AssetEvent, "amount"> & { amount: string })[];
+  };
+  const balances = new Map(Object.entries(stored.balances).map(([address, units]) => [address, BigInt(units)]));
+  let supply = 0n;
+  for (const units of balances.values()) supply += units;
+  const state: HoldingsState = {
+    balances,
+    authorized: new Map(Object.entries(stored.authorized)),
+    supply,
+    ledger: stored.ledger,
+    eventCount: stored.eventCount,
+    incomplete: [...balances]
+      .filter(([, units]) => units < 0n)
+      .map(([address]) => address)
+      .sort(),
+  };
+  if (stored.skipped.length > 0) state.skipped = stored.skipped.map((ev) => ({ ...ev, amount: BigInt(ev.amount) }));
+  return state;
+}
+
+/**
+ * Continue a replay from a checkpoint: `from` is the state after every event up to some ledger,
+ * `events` are the ones after it. Each holder keeps the cutoff its opening balance gave it, so the
+ * result is the one a replay of the whole history would give.
+ */
+function resume(
+  from: HoldingsState,
+  events: AssetEvent[],
+  opening: Map<string, Opening>,
+  baselineLedger: number,
+  upToTime?: string,
+): HoldingsState {
+  const seeded = new Map<string, Opening>();
+  for (const address of new Set([...opening.keys(), ...from.balances.keys(), ...from.authorized.keys()])) {
+    const seed: Opening = {
+      amount: from.balances.get(address) ?? 0n,
+      asOfLedger: opening.get(address)?.asOfLedger ?? baselineLedger,
+    };
+    const authorized = from.authorized.get(address);
+    if (authorized !== undefined) seed.authorized = authorized;
+    seeded.set(address, seed);
+  }
+  const next = replay(events, { opening: seeded, baselineLedger, ...(upToTime ? { upToTime } : {}) });
+  const state: HoldingsState = {
+    balances: next.balances,
+    authorized: next.authorized,
+    supply: next.supply,
+    ledger: Math.max(from.ledger, next.ledger),
+    eventCount: from.eventCount + next.eventCount,
+    // A holder carried negative from the checkpoint is still short of history even if no later
+    // event touches it.
+    incomplete: [...next.balances]
+      .filter(([, units]) => units < 0n)
+      .map(([address]) => address)
+      .sort(),
+  };
+  const skipped = [...(from.skipped ?? []), ...(next.skipped ?? [])];
+  if (skipped.length > 0) state.skipped = skipped;
+  return state;
+}
+
 /**
  * One workspace: every operation the API and the CLI expose over a single database.
  * Reads the chain, never writes it.
@@ -377,12 +458,17 @@ export class Concord {
   /** Current holdings per asset; replaying every event on each dashboard poll is too slow. */
   private readonly stateMemo = new Map<string, HoldingsState>();
   private seenVersion: number;
+  private readonly checkpointEvery: number;
 
   constructor(
     readonly db: Db,
     readonly networks: Networks,
+    options: { checkpointEvery?: number } = {},
   ) {
     this.seenVersion = db.dataVersion();
+    const every = options.checkpointEvery ?? CHECKPOINT_EVERY;
+    if (!Number.isSafeInteger(every) || every < 1) throw new Error("checkpointEvery must be a positive integer");
+    this.checkpointEvery = every;
   }
 
   /** Forget cached holdings for an asset this instance just changed. */
@@ -595,6 +681,8 @@ export class Concord {
         );
       }
     }
+    // Checkpoints fold in the opening balances and the baseline ledger, both just (re)set.
+    this.db.write("DELETE FROM holdings_checkpoints WHERE asset_id = ?", asset.id);
     this.touch(asset.id);
     return this.asset(asset.id);
   }
@@ -661,6 +749,7 @@ export class Concord {
     this.db.tx(() => {
       this.db.write("DELETE FROM events WHERE asset_id = ?", asset.id);
       this.db.write("DELETE FROM openings WHERE asset_id = ?", asset.id);
+      this.db.write("DELETE FROM holdings_checkpoints WHERE asset_id = ?", asset.id);
       this.db.write(
         `UPDATE assets SET state = 'indexing', start_mode = ?, start_ledger = NULL, baseline_ledger = NULL,
            history_from = NULL, cursor = NULL, synced_ledger = NULL, synced_at = NULL, sync_error = NULL, sync_error_at = NULL
@@ -775,7 +864,16 @@ export class Concord {
         !cursor || cursor === previous || (page.events.length < limit && cursorLedger(cursor) >= page.latestLedger);
       let wrote = 0;
       this.db.tx(() => {
-        for (const ev of page.events) wrote += this.insertEvent(asset.id, ev) ? 1 : 0;
+        let lowest: number | undefined;
+        for (const ev of page.events) {
+          if (!this.insertEvent(asset.id, ev)) continue;
+          wrote++;
+          if (lowest === undefined || ev.ledger < lowest) lowest = ev.ledger;
+        }
+        // A checkpoint at or after a ledger that just gained an event no longer covers it.
+        if (lowest !== undefined) {
+          this.db.write("DELETE FROM holdings_checkpoints WHERE asset_id = ? AND ledger >= ?", asset.id, lowest);
+        }
         if (atTip) {
           this.db.write(
             `UPDATE assets SET cursor = COALESCE(?, cursor), synced_ledger = MAX(COALESCE(synced_ledger, 0), ?),
@@ -852,7 +950,13 @@ export class Concord {
     return out;
   }
 
-  /** Holdings from replaying events over the opening balances. Treat the result as read-only. */
+  /**
+   * Holdings from replaying events over the opening balances. Treat the result as read-only.
+   *
+   * Without `events`, the replay starts from the nearest stored checkpoint at or before
+   * `upToTime` and reads only the events after it, so the cost near the tip does not grow with
+   * the length of the history. Given `events`, it replays exactly those.
+   */
   state(asset: AssetRecord, upToTime?: string, events?: AssetEvent[]): HoldingsState {
     const current = upToTime === undefined && events === undefined;
     if (current) {
@@ -860,13 +964,81 @@ export class Concord {
       const hit = this.stateMemo.get(asset.id);
       if (hit) return hit;
     }
-    const state = replay(events ?? this.loadEvents(asset.id), {
-      opening: this.openings(asset.id),
-      baselineLedger: asset.baselineLedger ?? 0,
-      ...(upToTime ? { upToTime } : {}),
-    });
+    const opening = this.openings(asset.id);
+    const baselineLedger = asset.baselineLedger ?? 0;
+    let state: HoldingsState;
+    if (events) {
+      state = replay(events, { opening, baselineLedger, ...(upToTime ? { upToTime } : {}) });
+    } else {
+      this.extendCheckpoints(asset.id, opening, baselineLedger);
+      const checkpoint = upToTime
+        ? this.db.get(
+            "SELECT * FROM holdings_checkpoints WHERE asset_id = ? AND closed_at <= ? ORDER BY ledger DESC LIMIT 1",
+            asset.id,
+            upToTime,
+          )
+        : this.db.get("SELECT * FROM holdings_checkpoints WHERE asset_id = ? ORDER BY ledger DESC LIMIT 1", asset.id);
+      if (checkpoint) {
+        const tail = this.db
+          .all(
+            `SELECT * FROM events WHERE asset_id = ? AND ledger > ?${upToTime ? " AND closed_at <= ?" : ""} ORDER BY id`,
+            asset.id,
+            Number(checkpoint.ledger),
+            ...(upToTime ? [upToTime] : []),
+          )
+          .map(toEvent);
+        state = resume(decodeCheckpoint(String(checkpoint.state)), tail, opening, baselineLedger, upToTime);
+      } else {
+        state = replay(this.loadEvents(asset.id), { opening, baselineLedger, ...(upToTime ? { upToTime } : {}) });
+      }
+    }
     if (current) this.stateMemo.set(asset.id, state);
     return state;
+  }
+
+  /**
+   * Store a checkpoint after every `checkpointEvery` events not yet covered by one. A checkpoint
+   * sits on a ledger boundary (every event after it is in a later ledger) and records the latest
+   * close time it covers, so a replay up to any later time can start from it. The newest ledger
+   * is never checkpointed: more of its events may still arrive.
+   */
+  private extendCheckpoints(assetId: string, opening: Map<string, Opening>, baselineLedger: number): void {
+    const last = this.db.get(
+      "SELECT ledger, closed_at, state FROM holdings_checkpoints WHERE asset_id = ? ORDER BY ledger DESC LIMIT 1",
+      assetId,
+    );
+    const after = last ? Number(last.ledger) : -1;
+    const pending =
+      this.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM events WHERE asset_id = ? AND ledger > ?", assetId, after)
+        ?.n ?? 0;
+    if (pending <= this.checkpointEvery) return;
+    const events = sortEvents(
+      this.db.all("SELECT * FROM events WHERE asset_id = ? AND ledger > ?", assetId, after).map(toEvent),
+    );
+    // Lowest ledger at or after each position: a boundary needs every later event in a later ledger.
+    const lowestFrom = new Array<number>(events.length + 1).fill(Number.POSITIVE_INFINITY);
+    for (let i = events.length - 1; i >= 0; i--) lowestFrom[i] = Math.min(events[i]!.ledger, lowestFrom[i + 1]!);
+    let state = last ? decodeCheckpoint(String(last.state)) : undefined;
+    let closedAt = last ? String(last.closed_at) : "";
+    let start = 0;
+    this.db.tx(() => {
+      for (let i = 0; i < events.length - 1; i++) {
+        const ev = events[i]!;
+        if (ev.closedAt > closedAt) closedAt = ev.closedAt;
+        if (i + 1 - start < this.checkpointEvery || lowestFrom[i + 1]! <= ev.ledger) continue;
+        const chunk = events.slice(start, i + 1);
+        state = state ? resume(state, chunk, opening, baselineLedger) : replay(chunk, { opening, baselineLedger });
+        this.db.write(
+          "INSERT OR REPLACE INTO holdings_checkpoints (asset_id, ledger, closed_at, state, created_at) VALUES (?, ?, ?, ?, ?)",
+          assetId,
+          ev.ledger,
+          closedAt,
+          encodeCheckpoint(state),
+          now(),
+        );
+        start = i + 1;
+      }
+    });
   }
 
   holdings(ref: string, asOf?: string) {

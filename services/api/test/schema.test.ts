@@ -84,6 +84,10 @@ describe("schema cascade deletion", () => {
       INSERT INTO break_note_history (asset_id, scope, key, fingerprint, status, note, at)
       VALUES ('A', 'scope', 'kA', 'fp', 'open', 'note', '2026-01-01'),
              ('B', 'scope', 'kB', 'fp', 'open', 'note', '2026-01-01');
+
+      INSERT INTO holdings_checkpoints (asset_id, ledger, closed_at, state, created_at)
+      VALUES ('A', 1, '2026-01-01', '{}', '2026-01-01'),
+             ('B', 1, '2026-01-01', '{}', '2026-01-01');
     `);
 
     // Verify before deletion: each child table has 2 rows (one for A, one for B)

@@ -78,6 +78,17 @@ build(join(outDir, "org-v5.db"), ORG_MIGRATIONS.slice(0, 5), (db) => {
     VALUES ('usd-mainnet', 'mainnet', 'USD', 'GISSUER1', 'US Dollar', 7, 'baseline', 'ready', '5', '2024-01-01T00:00:00Z')`);
 });
 
+// v6 adds holdings checkpoints; one row proves the table survives later upgrades.
+build(join(outDir, "org-v6.db"), ORG_MIGRATIONS.slice(0, 6), (db) => {
+  db.exec("INSERT INTO meta (key, value) VALUES ('fixture', 'org-v6')");
+  db.exec(`INSERT INTO assets (id, network, code, issuer, name, decimals, start_mode, state, created_at)
+    VALUES ('usd-mainnet', 'mainnet', 'USD', 'GISSUER1', 'US Dollar', 7, 'baseline', 'ready', '2024-01-01T00:00:00Z')`);
+  db.exec(`INSERT INTO holdings_checkpoints (asset_id, ledger, closed_at, state, created_at)
+    VALUES ('usd-mainnet', 100, '2024-01-02T00:00:00Z',
+      '{"balances":{"GA":"5000"},"authorized":{"GA":true},"ledger":100,"eventCount":1,"skipped":[]}',
+      '2024-01-02T00:00:00Z')`);
+});
+
 build(join(outDir, "control-v1.db"), CONTROL_MIGRATIONS.slice(0, 1), (db) => {
   db.exec(`INSERT INTO users (id, email, name, email_verified, created_at)
     VALUES ('u1', 'alice@example.org', 'Alice', 1, '2024-01-01T00:00:00Z')`);
